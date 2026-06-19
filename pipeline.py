@@ -1,4 +1,6 @@
 #pip install matplotlib scipy numpy pandas
+#usage  py .\pipeline.py --csv crypto.csv
+#py .\pipeline.py --csv crypto.csv --date date --features 'open' --target volume
 
 from __future__ import annotations
 
@@ -54,6 +56,7 @@ class DataAnalysisPipeline:
     def run(self, data) -> dict:
         """Execute the full pipeline. `data` is a path or a DataFrame."""
         self._load(data)
+        self._profile()
 
     def _load(self, data) -> None:
 
@@ -73,6 +76,59 @@ class DataAnalysisPipeline:
             self.df = self.df.sort_values(self.cfg.date_col).reset_index(drop=True)
 
         self.log.info("Loaded %d rows x %d cols", *self.df.shape)
+
+    def _profile(self)->None:
+
+        df,cfg = self.df, self.cfg
+        num_cols = [cfg.target_col] + cfg.feature_cols
+        prof = {
+            "n_rows": int(len(df)),
+            "n_cols": int(df.shape[1]),
+            "duplicates": int(df.duplicated().sum()), #the sum of duplicated rows
+            "missing": df.isna().sum().to_dict(),     #sum of all misgginf values, by column {'colonna_A': 0, 'colonna_B': 5, 'colonna_C': 12}
+            "describe": df[num_cols].describe().round(2).to_dict(), # describe params for each column round to 2 decimals
+            "skew": {c: round(float(df[c].skew()), 3) for c in num_cols}, #calculate the skewness of each column
+            "kurtosis": {c: round(float(df[c].kurt()), 3) for c in num_cols}, # Calculates the kurtosis for each column
+        }
+
+        #describe - {'describe': {'column_A': {'mean': 10.50, 'std': 2.15}}}.(count, mean, standard deviation, minimum, 25%, 50%, 75% percentiles, and maximum)
+        #Skewness measures the asymmetry of the data distribution. A positive value means a tail stretching to the right; a negative value means a tail stretching to the left.
+        # High kurtosis indicates the presence of heavy tails (more outliers), while low kurtosis indicates light tails (fewer outliers)
+        self.log.info("Profiled: %d duplicates, %d cols with missing values",
+                      prof["duplicates"], sum(v > 0 for v in prof["missing"].values()))
+
+         # EDA figure: a histogram per numeric column + target scatter vs each feature
+        ncols = len(num_cols)
+        fig, ax = plt.subplots(2, max(ncols, len(cfg.feature_cols)),
+                               figsize=(4.8 * max(ncols, 1), 8), squeeze=False)
+
+        fig.suptitle("EDA — distributions & target relationships", fontsize=15, fontweight="bold")
+        colors = list(cfg.palette.values())
+        for i, c in enumerate(num_cols):
+            a = ax[0, i]
+            a.hist(df[c].dropna(), bins=40, color=colors[i % len(colors)],
+                   alpha=0.8, edgecolor="white", linewidth=0.4)
+            a.axvline(df[c].mean(), color="black", ls="--", lw=1)
+            a.set_title(f"Distribution: {c}")
+        for j in range(ncols, ax.shape[1]):
+            ax[0, j].axis("off")
+        for i, f in enumerate(cfg.feature_cols):
+            a = ax[1, i]
+            a.scatter(df[f], df[cfg.target_col], s=8, alpha=0.35,
+                      color=cfg.palette["orange"])
+            a.set_title(f"{cfg.target_col} vs {f}")
+            a.set_xlabel(f); a.set_ylabel(cfg.target_col)
+        for j in range(len(cfg.feature_cols), ax.shape[1]):
+            ax[1, j].axis("off")
+        plt.tight_layout()
+        self._save_fig(fig, "01_eda.png")
+
+    def _save_fig(self, fig, name: str) -> Path:
+        path = self.out / name
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        self.figures.append(path)
+        return path
 
     # -- infrastructure ----------------------------------------------------- #
     def _setup_logging(self) -> None:
