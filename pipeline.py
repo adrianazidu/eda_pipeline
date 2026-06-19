@@ -57,6 +57,7 @@ class DataAnalysisPipeline:
         """Execute the full pipeline. `data` is a path or a DataFrame."""
         self._load(data)
         self._profile()
+        self._clean()
 
     def _load(self, data) -> None:
 
@@ -122,6 +123,32 @@ class DataAnalysisPipeline:
             ax[1, j].axis("off")
         plt.tight_layout()
         self._save_fig(fig, "01_eda.png")
+
+    def _clean(self) -> None:
+        df, cfg = self.df, self.cfg
+        before = len(df)
+        if cfg.drop_duplicates:
+            df = df.drop_duplicates()
+        num_cols = [cfg.target_col] + cfg.feature_cols
+
+        # drop rows with missing values, fill them with the column's median, or fill them with the column's mean.
+
+        #drop columns that are in the num_cols list, not all
+        if cfg.impute_numeric == "drop":
+            df = df.dropna(subset=num_cols)
+        elif cfg.impute_numeric in ("median", "mean"):
+            for c in num_cols:
+                #It checks if the column actually contains any missing values 
+                if df[c].isna().any():
+                    #A ternary operator (conditional expression) that calculates either the median or the mean of that specific column.
+                    fill = df[c].median() if cfg.impute_numeric == "median" else df[c].mean()
+                    #It replaces all NaN values in that specific column with the calculated fill value.
+                    df[c] = df[c].fillna(fill)
+
+        self.df = df.reset_index(drop=True)
+        self.results["clean"] = {"rows_before": before, "rows_after": len(self.df),
+                                    "strategy": cfg.impute_numeric}
+        self.log.info("Cleaned: %d -> %d rows", before, len(self.df))
 
     def _save_fig(self, fig, name: str) -> Path:
         path = self.out / name
