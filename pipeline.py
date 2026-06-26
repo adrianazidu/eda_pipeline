@@ -1,4 +1,4 @@
-#pip install matplotlib scipy numpy pandas statsmodels pygam
+#pip install matplotlib scipy numpy pandas statsmodels pygam scikit-learn
 #usage  py .\pipeline.py --csv crypto.csv that has colsumns : date,open,high,low,close,volume
 #py .\pipeline.py --csv crypto.csv --date date --features 'open' --target volume
 
@@ -19,10 +19,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+#gam model
 from pygam import LinearGAM, s as _spline
 
 #seasonal decomposition to separate trend, seasonality, and residual
 from statsmodels.tsa.seasonal import STL 
+
+#LOF and StandardScaler
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
 
 #config
 @dataclass
@@ -63,9 +69,10 @@ class DataAnalysisPipeline:
         self._profile()        #profiling, produces 01_eda.png
         self._clean()
         if self.cfg.date_col:
-            self._decompose()  #STL decomposition, produce 02_timeseries.png
-        self._correlate()      #correlation spearman/pearson, produce 03_correlation.png
-        self._model_gam()      # apply GAM additive model to compute non linear relationships, produces 04_gam.png
+            self._decompose()    #STL decomposition, produce 02_timeseries.png
+        self._correlate()        #correlation spearman/pearson, produce 03_correlation.png
+        self._model_gam()        # apply GAM additive model to compute non linear relationships, produces 04_gam.png
+        self._detect_anomalies() # use LOF, produces 05_anomalies.png
 
         print(self.results)
 
@@ -326,6 +333,82 @@ class DataAnalysisPipeline:
             a.set_title(f"f({f})"); a.set_xlabel(f); a.set_ylabel("partial effect")
         plt.tight_layout()
         self._save_fig(fig, "04_gam.png")
+
+    """
+     LOF is a density-based anomaly detector. Its core idea: an outlier isn't simply a point far from the average 
+     it's a point in a sparser neighborhood than its neighbors occupy
+     LOF compares the local density around it to the local densities around its k nearest neighbors. 
+    A score near 1 means "as crowded as my neighbors" (normal); a score well above 1 means "I sit in a much emptier region than the points near me" (anomalous).
+    Scale your features (StandardScaler) before running LOF, because it relies on distances
+    """
+    def _detect_anomalies(self) -> None:
+        df, cfg = self.df, self.cfg
+        feats = [cfg.target_col] + cfg.feature_cols
+
+        #scaling shifts all variables to a standardized space where the mean is 0 and the standard deviation is 1. 
+        #This prevents massive columns from dominating the distance calculations
+        Xs = StandardScaler().fit_transform(df[feats])
+
+        #istantiate LOF algorithm
+        #n_neighbors: The size of the local neighborhood cluster to evaluate against (e.g., 20 points)
+        #contamination: The expected percentage of anomalies present in the dataset (e.g., 0.01 for 1%)
+        lof = LocalOutlierFactor(n_neighbors=cfg.lof_neighbors,
+                                 contamination=cfg.lof_contamination)
+
+        #Executes the spatial proximity logic on the scaled matrix. It evaluates the density of each point against its closest neighbors
+        # It outputs a simple array of flags: 1 for safe/normal rows, and -1 for anomalies
+        labels = lof.fit_predict(Xs)
+
+        #create dedicated copy to prevent warnings
+        df = df.copy()
+
+        """
+        Extracts the raw local density scores. By default, scikit-learn records these as negative values where lower means more anomalous. 
+        Inverting it with the negative sign (-) transforms it into a standard, clean score: a value near or below 1.0 is totally normal,
+         while high scores (like 1.5, 2.0, or higher) indicate an extreme outlier
+        """
+        df["lof_score"] = -lof.negative_outlier_factor_
+
+        #Creates a clear Boolean column (True or False) indicating whether LOF officially flagged that specific row as a high-density anomaly
+        df["is_outlier"] = labels == -1
+
+        #overwrite df with the new columns lof_score and is_outlier
+        self.df = df
+
+        #filter rows marked as true outliers, sorting them from the most extreme anomaly score down to the least extreme
+        flagged = df[df.is_outlier].sort_values("lof_score", ascending=False)
+
+        #isolate the columns we need
+        record = flagged[feats + ["lof_score"]].round(2)
+        if cfg.date_col:
+            record.insert(0, cfg.date_col, flagged[cfg.date_col].dt.date.astype(str).values)
+        self.results["anomalies"] = {
+            "method": "LocalOutlierFactor",
+            "n_flagged": int(df.is_outlier.sum()),            #the absolute count of how many rows were flagged as anomalies
+            "top": record.head(15).to_dict(orient="records"), #takes the top 15 most severe anomalies and translates them into a clean list of row dictionaries
+        }
+        self.log.info("Anomaly detection: %d points flagged", int(df.is_outlier.sum()))
+
+        if cfg.date_col:
+            fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
+            fig.suptitle("Anomalies — Local Outlier Factor", fontsize=14, fontweight="bold")
+            ax[0].plot(df[cfg.date_col], df[cfg.target_col], color=cfg.palette["blue"], lw=0.6, alpha=0.7)
+            ax[0].scatter(flagged[cfg.date_col], flagged[cfg.target_col],
+                          color=cfg.palette["red"], s=70, zorder=5, label="outlier")
+            ax[0].set_title("Outliers over time"); ax[0].legend(fontsize=9)
+            f0 = cfg.feature_cols[0]
+            sc = ax[1].scatter(df[f0], df[cfg.target_col], c=df.lof_score, cmap="viridis", s=14, alpha=0.6)
+            ax[1].scatter(flagged[f0], flagged[cfg.target_col], facecolors="none",
+                          edgecolors=cfg.palette["red"], s=140, linewidths=1.8)
+            ax[1].set_title(f"Feature space ({f0} vs {cfg.target_col})")
+            ax[1].set_xlabel(f0); ax[1].set_ylabel(cfg.target_col)
+            plt.colorbar(sc, ax=ax[1], label="LOF score")
+            plt.tight_layout()
+            self._save_fig(fig, "05_anomalies.png")
+
+        # persist the enriched dataset
+        df.to_csv(self.out / "scored_data.csv", index=False)
+
 
 
     def _save_fig(self, fig, name: str) -> Path:
