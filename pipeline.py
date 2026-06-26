@@ -62,8 +62,8 @@ class DataAnalysisPipeline:
         self._profile()
         self._clean()
         if self.cfg.date_col:
-            self._decompose()
-    
+            self._decompose()  #STL decomposition
+        self._correlate()      #correlation spearman/pearson
 
     def _load(self, data) -> None:
 
@@ -169,7 +169,15 @@ class DataAnalysisPipeline:
 
         #run STL, use a robust loop to ignore existing extreme outliers during calculations.
         stl = STL(s, period=cfg.seasonal_period, robust=True).fit()
-        #extract values from result
+    
+        """extract values from result
+          - residual = what is left after you strip away the predictable patterns (trend and seasonality) = pure noise 
+          - The Threshold is a statistical boundary used to separate "normal everyday noise" from "something unusual happened."
+             Equals = multiplier (2 or 3) * standard deviation of all residuals
+            Standard deviation measures how much your typical daily noise fluctuates. By multiplying it by a factor (usually 2 or 3),
+             you create a strict mathematical boundary. Anything inside this boundary is considered acceptable random variation.
+        - outliers = the anomalies, where the value breaks the threshold
+        """
 
         #the residual component (random noise)
         resid = stl.resid                       
@@ -213,6 +221,56 @@ class DataAnalysisPipeline:
         ax[4].set_title("Residual (flagged outliers in red)")
         plt.tight_layout()
         self._save_fig(fig, "02_timeseries.png")
+
+    #Correlations tell you which variables move together
+    #Pearson captures linear relationships; Spearman or Kendall capture monotonic ones
+    def _correlate(self) -> None:
+        df, cfg = self.df, self.cfg
+        #compute rank correlation matrix between target variable and all other feature columns
+        cols = [cfg.target_col] + cfg.feature_cols
+        pear = df[cols].corr("pearson")   
+        spear = df[cols].corr("spearman")
+
+        # flag pairs where spearman notably exceeds pearson (monotonic nonlinearity)
+        flags = []
+
+        #iterate through every column
+        #then iterate again to pair the current column with the next one (i+1)
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+
+                #extract the correlation values and check abs diff 
+                p, sp = pear.iloc[i, j], spear.iloc[i, j]
+
+                # If true, it means the two variables move together predictably, but the relationship is curved or non-linear.
+                if abs(sp) - abs(p) > 0.1:
+                    flags.append({"pair": [cols[i], cols[j]],
+                                  "pearson": round(float(p), 3),
+                                  "spearman": round(float(sp), 3)})
+
+        self.results["correlation"] = {
+            "pearson_with_target": {c: round(float(pear.loc[cfg.target_col, c]), 3)
+                                    for c in cfg.feature_cols},
+            "spearman_with_target": {c: round(float(spear.loc[cfg.target_col, c]), 3)
+                                     for c in cfg.feature_cols},
+            "nonlinear_flags": flags,
+        }
+        self.log.info("Correlated: %d pair(s) show monotonic nonlinearity", len(flags))
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle("Correlation — Pearson vs Spearman", fontsize=14, fontweight="bold")
+        for a, M, name in zip(ax, [pear, spear], ["Pearson (linear)", "Spearman (rank)"]):
+            im = a.imshow(M, vmin=-1, vmax=1, cmap="RdBu_r")
+            a.set_xticks(range(len(cols))); a.set_yticks(range(len(cols)))
+            a.set_xticklabels(cols, rotation=45, ha="right"); a.set_yticklabels(cols)
+            for i in range(len(cols)):
+                for j in range(len(cols)):
+                    v = M.iloc[i, j]
+                    a.text(j, i, f"{v:.2f}", ha="center", va="center",
+                           color="white" if abs(v) > 0.5 else "black", fontsize=9)
+            a.set_title(name); plt.colorbar(im, ax=a, fraction=0.046)
+        plt.tight_layout()
+        self._save_fig(fig, "03_correlation.png")
 
     def _save_fig(self, fig, name: str) -> Path:
         path = self.out / name
