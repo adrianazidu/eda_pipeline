@@ -26,6 +26,10 @@ from pygam import LinearGAM, s as _spline
 #seasonal decomposition to separate trend, seasonality, and residual
 from statsmodels.tsa.seasonal import STL 
 
+#shap
+from sklearn.ensemble import GradientBoostingRegressor
+import shap
+
 #LOF and StandardScaler
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
@@ -46,6 +50,9 @@ class PipelineConfig:
     output_dir: str = "pipeline_output"
     drop_duplicates: bool = True
     impute_numeric: str = "median"                # "median" | "mean" | "drop" | "none"
+    #shap
+    shap_estimators: int = 200                    # trees in the gradient-boosting surrogate
+    shap_max_depth: int = 3
     palette: dict = field(default_factory=lambda: {
         "blue": "#2563eb", "orange": "#ea580c",
         "red": "#dc2626", "green": "#16a34a", "grey": "#64748b",
@@ -72,6 +79,7 @@ class DataAnalysisPipeline:
             self._decompose()    #STL decomposition, produce 02_timeseries.png
         self._correlate()        #correlation spearman/pearson, produce 03_correlation.png
         self._model_gam()        # apply GAM additive model to compute non linear relationships, produces 04_gam.png
+        self._explain_shap()     #apply shap gradient booster to compute mathematical importance of each feature, produces 06_shap.png
         self._detect_anomalies() # use LOF, produces 05_anomalies.png
 
         print(self.results)
@@ -333,6 +341,93 @@ class DataAnalysisPipeline:
             a.set_title(f"f({f})"); a.set_xlabel(f); a.set_ylabel("partial effect")
         plt.tight_layout()
         self._save_fig(fig, "04_gam.png")
+
+
+    #trains a complex predictive model (Gradient Boosting) and then dissects it row by row using SHAP (SHapley Additive exPlanations) values
+    def _explain_shap(self) -> None:
+        """Fit a flexible gradient-boosting model and explain it with SHAP.
+
+        The GAM stage gives interpretable *additive* partial effects; SHAP here
+        explains a model that can also capture feature *interactions*, and
+        attributes each prediction back to the features. Mean |SHAP| is a robust
+        global importance ranking; the beeswarm shows direction and the
+        dependence plot reveals nonlinear shape (e.g. the U in temperature).
+        """
+        df, cfg = self.df, self.cfg
+        X = df[cfg.feature_cols]
+        y = df[cfg.target_col].values
+        
+        """
+        Instantiates and trains a Gradient Boosting Regressor.
+         This model is an ensemble of decision trees that learns complex, non-linear patterns and deep interactions between variables.
+         It uses the number of trees (n_estimators) and maximum depth (max_depth) defined in your configuration
+        """
+        model = GradientBoostingRegressor(
+            n_estimators=cfg.shap_estimators, max_depth=cfg.shap_max_depth,
+            random_state=0).fit(X, y)
+
+        #Calculates the traditional R² (coefficient of determination) of the Gradient Boosting model on the training data to see how accurately it fits
+        r2 = float(model.score(X, y))
+
+        #This algorithm calculates the exact mathematical impact of each feature on every individual prediction incredibly fast
+        explainer = shap.TreeExplainer(model)
+
+        """
+        Calculates the array of SHAP values (sv) for every single row in your dataset.
+         For every row of data fed into it, SHAP assigns a positive or negative score to each feature, 
+        quantifying how much that specific value pushed the prediction up or down relative to the global baseline average.
+        """
+        sv = explainer(X)
+
+        """
+        Calculates the overall global importance of each variable.
+        It takes the absolute value (np.abs) of all SHAP scores to ignore whether the impact was positive or negative, 
+        and averages them (.mean(axis=0)) across the entire dataset. 
+        The feature with the highest average absolute SHAP value is the one that moves the model's needle the most.
+        """
+        mean_abs = np.abs(sv.values).mean(axis=0)
+
+        #Creates a Python dictionary pairing each feature name with its average SHAP importance score, rounded to two decimal places
+        importance = {f: round(float(v), 2) for f, v in zip(cfg.feature_cols, mean_abs)}
+
+        #Sorts the importance dictionary in descending order (reverse=True), 
+        #placing the most influential variable at the very top of the list and the least important one at the bottom.
+        ranked = dict(sorted(importance.items(), key=lambda kv: kv[1], reverse=True))
+        self.results["shap"] = {
+            "surrogate_model": "GradientBoostingRegressor",
+            "surrogate_r2": round(r2, 3),      #the accuracy R² of the Gradient Boosting model, rounded to 3 decimal places
+            "mean_abs_shap": ranked,            #the complete, ordered ranking of feature importances
+            "top_feature": next(iter(ranked)),  # the name of the absolute most important variable (the first key in the sorted ranked dictionary
+        }
+        self.log.info("SHAP: surrogate R^2 = %.3f, top feature = %s",
+                      r2, next(iter(ranked)))
+
+        # Figure: global importance (bar) + beeswarm + dependence of top feature
+        top = next(iter(ranked))
+        top_idx = cfg.feature_cols.index(top)
+        fig = plt.figure(figsize=(16, 5))
+        fig.suptitle("SHAP — explaining the gradient-boosting model",
+                     fontsize=14, fontweight="bold")
+        ax1 = fig.add_subplot(1, 3, 1)
+        order = list(ranked.keys())
+        ax1.barh(order[::-1], [ranked[f] for f in order[::-1]], color=cfg.palette["blue"])
+        ax1.set_title("Global importance (mean |SHAP|)")
+        ax1.set_xlabel("mean |SHAP value|")
+
+        ax2 = fig.add_subplot(1, 3, 2)
+        plt.sca(ax2)
+        shap.summary_plot(sv.values, X, show=False, plot_size=None, color_bar=True)
+        ax2.set_title("Beeswarm (impact + direction)")
+
+        ax3 = fig.add_subplot(1, 3, 3)
+        ax3.scatter(X[top], sv.values[:, top_idx], s=10, alpha=0.4,
+                    color=cfg.palette["orange"])
+        ax3.axhline(0, color="black", lw=0.8)
+        ax3.set_title(f"Dependence: {top}")
+        ax3.set_xlabel(top); ax3.set_ylabel(f"SHAP value for {top}")
+        ax3.grid(alpha=0.25)
+        plt.tight_layout()
+        self._save_fig(fig, "06_shap.png")
 
     """
      LOF is a density-based anomaly detector. Its core idea: an outlier isn't simply a point far from the average 
