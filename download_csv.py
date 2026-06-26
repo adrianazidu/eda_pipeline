@@ -3,7 +3,7 @@
 import ccxt, pandas as pd
 
 exchange = ccxt.binance()                 # or: ccxt.coinbase()
-ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="1d", limit=1000)
+ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="1w", limit=1000)
 df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
 df["date"] = pd.to_datetime(df["ts"], unit="ms")
 df[["date", "open", "high", "low", "close", "volume"]].to_csv("crypto.csv", index=False)

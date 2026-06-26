@@ -1,4 +1,4 @@
-#pip install matplotlib scipy numpy pandas
+#pip install matplotlib scipy numpy pandas statsmodels
 #usage  py .\pipeline.py --csv crypto.csv
 #py .\pipeline.py --csv crypto.csv --date date --features 'open' --target volume
 
@@ -19,6 +19,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+#seasonal decomposition to separate trend, seasonality, and residual
+from statsmodels.tsa.seasonal import STL 
 
 #config
 @dataclass
@@ -58,6 +61,9 @@ class DataAnalysisPipeline:
         self._load(data)
         self._profile()
         self._clean()
+        if self.cfg.date_col:
+            self._decompose()
+    
 
     def _load(self, data) -> None:
 
@@ -124,6 +130,7 @@ class DataAnalysisPipeline:
         plt.tight_layout()
         self._save_fig(fig, "01_eda.png")
 
+    #clean empty values
     def _clean(self) -> None:
         df, cfg = self.df, self.cfg
         before = len(df)
@@ -149,6 +156,63 @@ class DataAnalysisPipeline:
         self.results["clean"] = {"rows_before": before, "rows_after": len(self.df),
                                     "strategy": cfg.impute_numeric}
         self.log.info("Cleaned: %d -> %d rows", before, len(self.df))
+
+     #perform STL decomposition on time series
+    def _decompose(self) -> None:
+        df, cfg = self.df, self.cfg
+
+        #set datraframe index to date column, enforce daily frequencey (D)
+        s = (df.set_index(cfg.date_col)[cfg.target_col]).asfreq("D")
+
+        #fill missing data gaps with linear interpolation
+        s = s.interpolate()  # STL needs a gap-free series
+
+        #run STL, use a robust loop to ignore existing extreme outliers during calculations.
+        stl = STL(s, period=cfg.seasonal_period, robust=True).fit()
+        #extract values from result
+
+        #the residual component (random noise)
+        resid = stl.resid                       
+
+        #Calculates an outlier threshold by multiplying a user-defined multiplier (usually 2 or 3 standard deviations) by the standard deviation of the residuals
+        thresh = cfg.resid_sigma * resid.std()
+        
+        ##the residual component (random noise)
+        resid_outliers = resid[resid.abs() > thresh]
+
+        #create a dict with the results
+        #trend change - Calculates the overall net change in the underlying trend line from the very first day to the very last day, rounded to 2 decimal places
+        #seasonal amplitude - Calculates the peak-to-trough range of the seasonal pattern, showing the maximum magnitude of the cyclical swings
+        #resid outlier dates - Converts the datetime index of the flagged outliers into a clean list of string formatted dates (YYYY-MM-DD).
+        self.results["decompose"] = {
+            "period": cfg.seasonal_period,
+            "trend_change": round(float(stl.trend.iloc[-1] - stl.trend.iloc[0]), 2),
+            "seasonal_amplitude": round(float(stl.seasonal.max() - stl.seasonal.min()), 2),
+            "resid_outlier_dates": [str(d.date()) for d in resid_outliers.index],
+        }
+        # store for later reuse by anomaly stage
+        self._stl_resid = resid
+        self.log.info("Decomposed: trend change %.0f, %d residual outliers",
+                      self.results["decompose"]["trend_change"], len(resid_outliers))
+
+        weekly = s.resample("W").mean()
+        monthly = s.resample("ME").mean()
+        fig, ax = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
+        fig.suptitle("Time series — bucket aggregation + STL decomposition",
+                     fontsize=15, fontweight="bold")
+        ax[0].plot(s.index, s.values, color=cfg.palette["blue"], lw=0.6, alpha=0.7, label="daily")
+        ax[0].plot(weekly.index, weekly.values, color=cfg.palette["red"], lw=1.6, label="weekly mean")
+        ax[0].plot(monthly.index, monthly.values, color="black", lw=2, label="monthly mean")
+        ax[0].set_title("Raw + bucket aggregations"); ax[0].legend(fontsize=9)
+        ax[1].plot(stl.observed.index, stl.observed, color=cfg.palette["blue"], lw=0.6); ax[1].set_title("Observed")
+        ax[2].plot(stl.trend.index, stl.trend, color="black", lw=1.8); ax[2].set_title("Trend")
+        ax[3].plot(stl.seasonal.index, stl.seasonal, color=cfg.palette["green"], lw=0.5); ax[3].set_title("Seasonal")
+        ax[4].plot(resid.index, resid, color=cfg.palette["orange"], lw=0.4)
+        ax[4].axhline(0, color="black", lw=0.8)
+        ax[4].scatter(resid_outliers.index, resid_outliers.values, color=cfg.palette["red"], s=40, zorder=5)
+        ax[4].set_title("Residual (flagged outliers in red)")
+        plt.tight_layout()
+        self._save_fig(fig, "02_timeseries.png")
 
     def _save_fig(self, fig, name: str) -> Path:
         path = self.out / name
