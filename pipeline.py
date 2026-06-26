@@ -1,5 +1,5 @@
-#pip install matplotlib scipy numpy pandas statsmodels
-#usage  py .\pipeline.py --csv crypto.csv
+#pip install matplotlib scipy numpy pandas statsmodels pygam
+#usage  py .\pipeline.py --csv crypto.csv that has colsumns : date,open,high,low,close,volume
 #py .\pipeline.py --csv crypto.csv --date date --features 'open' --target volume
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
+from pygam import LinearGAM, s as _spline
 
 #seasonal decomposition to separate trend, seasonality, and residual
 from statsmodels.tsa.seasonal import STL 
@@ -59,11 +60,14 @@ class DataAnalysisPipeline:
     def run(self, data) -> dict:
         """Execute the full pipeline. `data` is a path or a DataFrame."""
         self._load(data)
-        self._profile()
+        self._profile()        #profiling, produces 01_eda.png
         self._clean()
         if self.cfg.date_col:
-            self._decompose()  #STL decomposition
-        self._correlate()      #correlation spearman/pearson
+            self._decompose()  #STL decomposition, produce 02_timeseries.png
+        self._correlate()      #correlation spearman/pearson, produce 03_correlation.png
+        self._model_gam()      # apply GAM additive model to compute non linear relationships, produces 04_gam.png
+
+        print(self.results)
 
     def _load(self, data) -> None:
 
@@ -271,6 +275,58 @@ class DataAnalysisPipeline:
             a.set_title(name); plt.colorbar(im, ax=a, fraction=0.046)
         plt.tight_layout()
         self._save_fig(fig, "03_correlation.png")
+
+
+    #trains a GAM (Generalized Additive Model) using the pygam library
+    # capture non-linear relationships between your input variables (features) and the target variable, 
+    #and then visualize the isolated effect of each feature using partial dependence plots.
+    def _model_gam(self) -> None:
+
+        df, cfg = self.df, self.cfg
+
+        #Extracts the values of the feature columns as a 2D NumPy array (X)
+        X = df[cfg.feature_cols].values
+        #Extracts the values of the target column as a 1D NumPy array (y)
+        y = df[cfg.target_col].values
+
+        #Initializes the mathematical structure of the GAM by creating a spline (a flexible, smooth curve)  (on index 0 for first column)
+        terms = _spline(0)
+
+        #continue with a loop starting from index  1 , add a new spline for each feature 
+        # gam is an additive model so feature functions are summed together
+        for k in range(1, len(cfg.feature_cols)):
+            terms = terms + _spline(k)
+
+        #nstantiates a Linear GAM using the constructed spline terms and trains it (.fit(X, y)) to find the smooth curves that best fit the dataset
+        gam = LinearGAM(terms).fit(X, y)
+
+        #Extracts the Pseudo R² value based on explained deviance. This tells you the proportion of variance explained by this non-linear model 
+        #(closer to 1.0 means a stronger fit)
+        pr2 = float(gam.statistics_["pseudo_r2"]["explained_deviance"])
+
+        #save the result
+        self.results["gam"] = {"pseudo_r2": round(pr2, 3), "features": cfg.feature_cols}
+        self.log.info("GAM fitted: pseudo R^2 = %.3f", pr2)
+
+        """
+        GAM Bridges the Gap Between Simple and Complex Models
+        - Linear Regression: Easy to understand, but too dumb to capture complex curves.
+        - Machine Learning (XGBoost / Random Forests): Highly accurate, but complete "black boxes" that are impossible to explain to a client
+        """
+
+        n = len(cfg.feature_cols)
+        fig, ax = plt.subplots(1, n, figsize=(5.5 * n, 5), squeeze=False)
+        fig.suptitle("GAM — partial effect of each feature", fontsize=14, fontweight="bold")
+        for k, f in enumerate(cfg.feature_cols):
+            XX = gam.generate_X_grid(term=k)
+            pdep, ci = gam.partial_dependence(term=k, X=XX, width=0.95)
+            a = ax[0, k]
+            a.plot(XX[:, k], pdep, color=cfg.palette["blue"], lw=2.5)
+            a.fill_between(XX[:, k], ci[:, 0], ci[:, 1], color=cfg.palette["blue"], alpha=0.2)
+            a.set_title(f"f({f})"); a.set_xlabel(f); a.set_ylabel("partial effect")
+        plt.tight_layout()
+        self._save_fig(fig, "04_gam.png")
+
 
     def _save_fig(self, fig, name: str) -> Path:
         path = self.out / name
