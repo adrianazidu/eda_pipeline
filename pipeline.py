@@ -1,4 +1,4 @@
-#pip install matplotlib scipy numpy pandas statsmodels pygam scikit-learn
+#pip install matplotlib scipy numpy pandas statsmodels pygam scikit-learn shap
 #usage  py .\pipeline.py --csv crypto.csv that has colsumns : date,open,high,low,close,volume
 #py .\pipeline.py --csv crypto.csv --date date --features 'open' --target volume
 
@@ -75,6 +75,7 @@ class DataAnalysisPipeline:
         self._load(data)
         self._profile()        #profiling, produces 01_eda.png
         self._clean()
+        self._engineer_features()
         if self.cfg.date_col:
             self._decompose()    #STL decomposition, produce 02_timeseries.png
         self._correlate()        #correlation spearman/pearson, produce 03_correlation.png
@@ -82,7 +83,60 @@ class DataAnalysisPipeline:
         self._explain_shap()     #apply shap gradient booster to compute mathematical importance of each feature, produces 06_shap.png
         self._detect_anomalies() # use LOF, produces 05_anomalies.png
 
+        report_path = self._report()
+        self.log.info("Done. Report -> %s", report_path)
+
         print(self.results)
+
+    def _engineer_features(self) -> None:
+        """Derive informative columns from raw OHLCV and register them as features.
+
+        Runs right after _clean. Appends new columns to self.df AND their names to
+        cfg.feature_cols, so every downstream stage picks them up automatically with
+        no further changes. Assumes columns: open, high, low, close, volume.
+        """
+        df, cfg = self.df, self.cfg
+        o, h, l, c, v = "open", "high", "low", "close", "volume"
+        if not all(col in df.columns for col in [o, h, l, c, v]):
+            self.results["feature_engineering"] = {"skipped": "missing OHLCV columns"}
+            return
+
+        # --- derived columns (each line = one new feature) ---
+        df["ret_1d"]      = df[c].pct_change()                          # daily return (the key transform)
+        df["ret_7d"]      = df[c].pct_change(7)                         # weekly momentum
+        df["log_ret"]     = np.log(df[c]).diff()                       # log return (additive over time)
+        df["volatility_14d"] = df["ret_1d"].rolling(14).std()          # recent turbulence
+        df["range_pct"]   = (df[h] - df[l]) / df[c]                    # intraday swing size
+        df["ma_20"]       = df[c].rolling(20).mean()                   # 20-day trend level
+        df["close_vs_ma20"] = df[c] / df["ma_20"] - 1                  # distance from trend (>0 = above)
+        df["vol_change"]  = df[v].pct_change()                         # volume momentum
+        df["vol_vs_avg"]  = df[v] / df[v].rolling(20).mean()           # today's volume vs its norm
+
+        new_features = ["ret_1d", "ret_7d", "log_ret", "volatility_14d", "range_pct",
+                        "close_vs_ma20", "vol_change", "vol_vs_avg"]
+
+        # drop warm-up rows that the rolling/lag windows left as NaN  (X data must not contain Inf nor NaN)
+        before = len(df)
+        df = df.dropna(subset=new_features).reset_index(drop=True)
+
+        # register the new columns so stages see them, avoiding duplicates
+        for f in new_features:
+            if f not in cfg.feature_cols:
+                cfg.feature_cols.append(f)
+
+        self.df = df
+        self.results["feature_engineering"] = {
+            "added": new_features,
+            "rows_dropped_warmup": before - len(df),
+            "feature_cols_now": cfg.feature_cols,
+        }
+        self.log.info("Engineered %d features; dropped %d warm-up rows",
+                    len(new_features), before - len(df))
+
+    def _report(self)-> Path:
+        path = self.out/"results.json"
+        path.write_text(json.dumps(self.results, indent = 2, default=str))
+        return path
 
     def _load(self, data) -> None:
 
