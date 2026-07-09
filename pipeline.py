@@ -72,12 +72,19 @@ class DataAnalysisPipeline:
 
     def run(self, data) -> dict:
         """Execute the full pipeline. `data` is a path or a DataFrame."""
+
+        # ingestion
         self._load(data)
         self._profile()        #profiling, produces 01_eda.png
         self._clean()
         self._engineer_features()
+
+        #time series
         if self.cfg.date_col:
             self._decompose()    #STL decomposition, produce 02_timeseries.png
+            self._stationarity() #ADF  and KPSS
+            self._arima()            # 14 — informed by the two stages above
+
         self._correlate()        #correlation spearman/pearson, produce 03_correlation.png
         self._model_gam()        # apply GAM additive model to compute non linear relationships, produces 04_gam.png
         self._explain_shap()     #apply shap gradient booster to compute mathematical importance of each feature, produces 06_shap.png
@@ -106,11 +113,21 @@ class DataAnalysisPipeline:
         df["ret_7d"]      = df[c].pct_change(7)                         # weekly momentum
         df["log_ret"]     = np.log(df[c]).diff()                       # log return (additive over time)
         df["volatility_14d"] = df["ret_1d"].rolling(14).std()          # recent turbulence
-        df["range_pct"]   = (df[h] - df[l]) / df[c]                    # intraday swing size
+        df["range_pct"]   = (df[h] - df[l]) / df[c]                    # intraday swing size (high - low) / close, diff between end and start day divided by close, to normalize it
         df["ma_20"]       = df[c].rolling(20).mean()                   # 20-day trend level
         df["close_vs_ma20"] = df[c] / df["ma_20"] - 1                  # distance from trend (>0 = above)
         df["vol_change"]  = df[v].pct_change()                         # volume momentum
         df["vol_vs_avg"]  = df[v] / df[v].rolling(20).mean()           # today's volume vs its norm
+
+        """
+        explanation
+        - pct-change = a pandas method that computes the percentage change from the previous row, formula (current − previous) / previous, 0.10 means it grew with 10%
+        - pct_change(7) compares to the row 7 back instead of 1 back, computing weekly return
+        - volatility_14d - apply on the column ret_1d that we have just created, then rolling(14) — creates a sliding window of 14 consecutive rows 
+                 which means group each row with the 13 rows before it, then compute standard deviation to each window
+                 So the value on any given row is the standard deviation of the last 14 daily returns
+                 he std is low → calm market, the std is high → turbulent market (measureing volatility)
+        """
 
         new_features = ["ret_1d", "ret_7d", "log_ret", "volatility_14d", "range_pct",
                         "close_vs_ma20", "vol_change", "vol_vs_avg"]
@@ -294,6 +311,78 @@ class DataAnalysisPipeline:
         ax[4].set_title("Residual (flagged outliers in red)")
         plt.tight_layout()
         self._save_fig(fig, "02_timeseries.png")
+
+    """
+    run before arima time series model
+    concept - a time series is stationary if its mean/variance don't change over time
+    this function runs 2 complementary tests, their results are opposite, 
+    Two tests rather than one because each is weak in different ways: ADF has low power, and KPSS can be fooled by certain trend shapes
+    ADF - Augemented Dickey-Fuller) and KPSS
+    """
+    def _stationarity(self) -> None:
+        from statsmodels.tsa.stattools import adfuller, kpss
+        import warnings
+        df, cfg = self.df, self.cfg
+
+        #makes the date column the DataFrame's index instead of an ordinary column
+        #[cfg.target_col] — selects that single column, so we now have a pandas Series (one column + a date index), not a DataFrame. adfuller and kpss want a 1-D sequence.
+        # asfreq("D") — enforces a daily frequency. This is the important one.
+        # If your data is missing 2024-03-05 entirely, asfreq inserts that date with a NaN value. Without this, pandas has 900 rows but no idea whether they're consecutive
+        #interpolate where value is Nan
+        #dropna() — a safety net. interpolate() can't fill NaNs at the very start of a series, since there's no earlier value to interpolate from
+        s = df.set_index(cfg.date_col)[cfg.target_col].asfreq("D").interpolate().dropna()
+
+        # the ADF test
+        #adfuller(s, ...) returns a tuple, not a single number
+        #autolag="AIC" — the ADF test needs to decide how many lagged terms to include (the "Augmented" part of Augmented Dickey-Fuller)
+        #Rather than picking a number, this tells it to try a range and keep whichever minimizes the Akaike Information Criterion
+        #[1] grabs element index 1 — the p-value. That's all we want
+        #float(...) — converts numpy's float64 to a plain Python floa
+        adf_p = float(adfuller(s, autolag="AIC")[1])
+
+        #the KPSS test
+        #catch warnings that KPSS emots a interpolationwarning when p value falls outside its lookup table
+        #the with block supresses warnings only inside
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            #regression="c" — tests stationarity around a constant. The alternative, regression="ct", tests around a constant and a linear trend
+            #lags="auto" — KPSS needs a bandwidth for its variance estimator; "auto" uses a data-driven rule rather than a hardcoded guess.
+            kpss_p = float(kpss(s, regression="c", nlags="auto")[1])
+
+        #compute verdict using both results
+        verdict = ("stationary" if adf_p < .05 and kpss_p > .05 else
+                "non-stationary" if adf_p > .05 and kpss_p < .05 else "inconclusive")
+
+        #store result to be interpreted by arima
+        self._d_order = 0 if verdict == "stationary" else 1
+
+        self.results["stationarity"] = {"adf_pvalue": round(adf_p, 4),   # <0.05 => stationary
+                                        "kpss_pvalue": round(kpss_p, 4),  # <0.05 => NON-stationary
+                                        "verdict": verdict}
+        self.log.info("Stationarity verdict: %s", verdict)
+
+    def _arima(self) -> None:
+        from statsmodels.tsa.statespace.sarimax import SARIMAX
+        df, cfg = self.df, self.cfg
+        s = df.set_index(cfg.date_col)[cfg.target_col].asfreq("D").interpolate()
+        train, test = s.iloc[:-30], s.iloc[-30:]
+
+        d = getattr(self, "_d_order", 1)          # default to 1 if stationarity didn't run
+        model = SARIMAX(train, order=(1, d, 1), seasonal_order=(1, 0, 1, cfg.seasonal_period),
+                        enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+
+        fc = model.get_forecast(30); pred = fc.predicted_mean
+        mae = float(np.mean(np.abs(pred.values - test.values)))
+        self.results["arima"] = {"order": "(1,1,1)(1,0,1)", "test_mae": round(mae, 2),
+                                "aic": round(float(model.aic), 1)}
+        self.log.info("SARIMA: test MAE %.2f", mae)
+        fig, ax = plt.subplots(figsize=(12, 4)); ci = fc.conf_int()
+        ax.plot(train.index[-90:], train.values[-90:], color=cfg.palette["blue"], label="train")
+        ax.plot(test.index, test.values, color="black", label="actual")
+        ax.plot(pred.index, pred.values, color=cfg.palette["red"], label="forecast")
+        ax.fill_between(pred.index, ci.iloc[:, 0], ci.iloc[:, 1], color=cfg.palette["red"], alpha=0.2)
+        ax.set_title("SARIMA 30-day forecast"); ax.legend(fontsize=9)
+        plt.tight_layout(); self._save_fig(fig, "14_arima.png")
 
     #Correlations tell you which variables move together
     #Pearson captures linear relationships; Spearman or Kendall capture monotonic ones
